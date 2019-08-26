@@ -1,0 +1,350 @@
+# %% [code]
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load in 
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+import json
+import codecs
+import requests
+from PIL import Image
+from tqdm import tqdm
+from io import BytesIO
+import torchvision
+import matplotlib.pyplot as plt
+import torch
+import copy
+from torchvision import transforms
+import shutil
+from PIL import Image
+
+# Input data files are available in the "../input/" directory.
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# Any results you write to the current directory are saved as output.
+
+# %% [code]
+jsonData = []
+JSONPATH = "../input/face-detection-in-images/face_detection.json"
+with codecs.open(JSONPATH, 'rU', 'utf-8') as js:
+    for line in js:
+        jsonData.append(json.loads(line))
+
+print(f"{len(jsonData)} image found!")
+
+print("Sample row:")
+jsonData[10]
+
+# %% [code]
+images = []
+for data in tqdm(jsonData):
+    response = requests.get(data['content'])
+    img = np.asarray(Image.open(BytesIO(response.content)))
+    images.append([img, data["annotation"]])
+
+# %% [code]
+train_dir = 'train'
+val_dir = 'val'
+
+for dir_name in [train_dir, val_dir]:
+    os.makedirs(dir_name, exist_ok=True)
+
+# %% [code]
+#np.save('images.npy', images)
+
+# %% [code]
+x_size = 512
+y_size = 512
+
+# %% [code]
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+# %% [code]
+def manxetten_len(P1, P2):
+    return (abs(P1.x - P2.x) + abs(P1.y - P2.y))
+def on_img(P1):
+    return ((0 < P1.x) and (P1.x < x_size)) and ((0 < P1.y) and (P1.y < y_size))
+
+# %% [code]
+def get_label(datalist):
+    ans = torch.zeros((y_size, x_size))
+    for i in range(len(datalist)):
+        data = datalist[i]
+        w = data['imageWidth']
+        h = data['imageHeight']
+        p1 = Point(data['points'][0]['x'] * w, 
+                   data['points'][0]['y'] * h)
+        p2 = Point(data['points'][1]['x'] * w, 
+                   data['points'][1]['y'] * h)
+        c = Point(int(((p1.x + p2.x) / 2) * x_size / data['imageWidth']), 
+                 int(((p1.y + p2.y) / 2) * y_size / data['imageHeight']))
+        r = 20
+        for j in range(2 * r + 1):
+            for k in range(2 * r + 1):
+                now = Point(c.x + j - r, c.y + k - r)
+                if (on_img(now)) :
+                    ans[now.y][now.x] = max(100 * 0.8 ** (manxetten_len(now, c)), ans[now.y][now.x])
+    return ans
+
+# %% [code]
+pics = []
+points = []
+results = []
+for i in tqdm(range(len(images))):
+    if (len(images[i][0].shape) == 2):
+        current = images[i][0]
+        source = np.zeros((current.shape[0], current.shape[1] ,3))
+        for j in range(current.shape[0]):
+            for k in range(current.shape[1]):
+                for c in range(3):
+                    source[j][k][c] = current[j][k]
+        source = Image.fromarray(source, 'RGB')
+    else:
+        source = Image.fromarray(images[i][0], 'RGB')
+    pics.append(source)
+    points.append(images[i][1])
+    results.append(get_label(images[i][1]))
+
+# %% [code]
+train_points = points[:5 * len(points) // 6]
+val_points = points[5 * len(points) // 6 : len(points)]
+
+pics_train_list = pics[:5 * len(pics) // 6]
+pics_val_list = pics[5 * len(pics) // 6 : len(points)]
+
+results_train = results[:5 * len(results) // 6]
+results_val = results[5 * len(results) // 6 : len(results)]
+
+# %% [code]
+for i in range(len(pics_train_list)):
+    pics_train_list[i].save(os.path.join(train_dir, "pic" + str(i)) , "JPEG")
+for i in range(len(pics_val_list)):
+    pics_val_list[i].save(os.path.join(val_dir, "pic" + str(i)) , "JPEG")
+
+# %% [code]
+data_root = '../working/train/'
+data_root = '../working/val/'
+
+# %% [code]
+del pics
+del images
+del pics_train_list
+del pics_val_list
+import gc
+gc.collect()
+
+# %% [code]
+class Dataset(torch.utils.data.Dataset):
+
+    def __init__(self, data_dir, result_list, transforms):
+        self.data_dir = data_dir
+        self.transforms = transforms
+        self.result_list = result_list
+
+    def __len__(self):
+        return len(self.result_list)
+
+    def __getitem__(self, idx):
+        return (self.transforms(Image.open(os.path.join(self.data_dir, "pic" + str(idx)))),  self.result_list[idx])
+
+# %% [code]
+train_transforms = transforms.Compose([
+    transforms.Resize((x_size, y_size)),
+    transforms.ToTensor(),
+])
+
+val_transforms = transforms.Compose([
+    transforms.Resize((x_size, y_size)),
+    transforms.ToTensor(),
+])
+
+train_dataset = Dataset(train_dir, results_train, train_transforms)
+val_dataset = Dataset(val_dir, results_val, val_transforms)
+
+batch_size = 8
+num_work = 8
+
+train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_work)
+val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_work)
+
+# %% [code]
+def train_model(model, loss, optimizer, scheduler, num_epochs):
+
+    sub_min = 1.
+    top_model = model
+    history = [[], []]
+    history_2 = [[], []]
+    for epoch in range(num_epochs):
+        print('Epoch {}/{}:'.format(epoch, num_epochs - 1), flush=True)
+
+        # Each epoch has a training and validation phase
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                dataloader = train_dataloader
+                scheduler.step()
+                model.train()  # Set model to training mode
+            else:
+                dataloader = val_dataloader
+                model.eval()   # Set model to evaluate mode
+
+            running_loss = 0.
+            sub_max_epoch = 0.
+
+            # Iterate over data.
+            for inputs, labels in tqdm(dataloader):
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                optimizer.zero_grad()
+
+                # forward and backward
+                with torch.set_grad_enabled(phase == 'train'):
+                    preds = model(inputs)
+                    sub_max_epoch = max(torch.max(torch.abs((labels - preds))).item(), sub_max_epoch)
+                    loss_value = loss(preds, labels)
+
+                    # backward + optimize only if in training phase
+                    if phase == 'train':
+                        loss_value.backward()
+                        optimizer.step()
+
+                # statistics
+                running_loss += loss_value.item()
+
+            epoch_loss = running_loss / len(dataloader)
+
+            print('{} Sub max: {:.4f} Loss: {:.4f}'.format(phase, sub_max_epoch, epoch_loss), flush=True)
+            
+            if (phase == 'val'):
+                history[0].append(epoch_loss)
+                history[1].append(epoch)
+                print(sub_max_epoch)
+                fig, graph = plt.subplots(figsize=(13,8))
+                graph.plot(history[1], history[0], 'o', linestyle='solid')
+                plt.show()
+                plt.pause(0.001)
+                number = 21 
+                test = train_transforms(Image.open(os.path.join(val_dir, "pic" + str(number)))) 
+                plt.imshow(test[0]) 
+                plt.pause(0.001) 
+                inp = torch.zeros((1, test.shape[0], test.shape[1], test.shape[2])) 
+                inp[0] = test 
+                inp = inp.to(device) 
+                res = model(inp).cpu()[0] 
+                plt.imshow(res.detach().numpy()[0]) 
+                plt.pause(0.001) 
+                plt.imshow(results_val[number]) 
+                plt.pause(0.001)
+            if (phase == 'val' and sub_min > sub_max_epoch):
+                sub_min = sub_max_epoch
+                top_model = copy.deepcopy(model)
+            
+            gc.collect()
+
+    return top_model
+
+# %% [code]
+class FaceNet(torch.nn.Module):
+    def __init__(self):
+        super(FaceNet, self).__init__()
+        self.con1 = torch.nn.Conv2d(in_channels=3, out_channels=4, kernel_size=5, padding=2)
+        self.ac1 = torch.nn.PReLU()
+        self.con2 = torch.nn.Conv2d(in_channels=4, out_channels=8, kernel_size=5, padding=2)
+        self.ac2 = torch.nn.PReLU()
+        self.con3 = torch.nn.Conv2d(in_channels=8, out_channels=16, kernel_size=5, padding=2)
+        self.ac3 = torch.nn.PReLU()
+        self.con4 = torch.nn.Conv2d(in_channels=16, out_channels=24, kernel_size=5, padding=2)
+        self.ac4 = torch.nn.PReLU()
+        self.con5 = torch.nn.Conv2d(in_channels=24, out_channels=32, kernel_size=5, padding=2)
+        self.ac5 = torch.nn.PReLU()
+        self.con6 = torch.nn.Conv2d(in_channels=32, out_channels=40, kernel_size=5, padding=2)
+        self.ac6 = torch.nn.PReLU()
+        self.con7 = torch.nn.Conv2d(in_channels=40, out_channels=48, kernel_size=5, padding=2)
+        self.ac7 = torch.nn.PReLU()
+        self.con8 = torch.nn.Conv2d(in_channels=48, out_channels=56, kernel_size=5, padding=2)
+        self.ac8 = torch.nn.PReLU()
+        self.con9 = torch.nn.Conv2d(in_channels=56, out_channels=1, kernel_size=5, padding=2)
+        self.ac9 = torch.nn.Sigmoid()
+        self.bn_2d_0 = torch.nn.BatchNorm2d(3)
+        self.bn_2d_1 = torch.nn.BatchNorm2d(4)
+        self.bn_2d_2 = torch.nn.BatchNorm2d(8)
+        self.bn_2d_3 = torch.nn.BatchNorm2d(16)
+        self.bn_2d_4 = torch.nn.BatchNorm2d(24)
+        self.bn_2d_5 = torch.nn.BatchNorm2d(32)
+        self.bn_2d_6 = torch.nn.BatchNorm2d(40)
+        self.bn_2d_7 = torch.nn.BatchNorm2d(48)
+        self.bn_2d_8 = torch.nn.BatchNorm2d(56)
+
+    def forward(self, x):
+        x = self.bn_2d_0(x)
+        x = self.ac1(self.con1(x))
+        x = self.bn_2d_1(x)
+        x = self.ac2(self.con2(x))
+        x = self.bn_2d_2(x)
+        x = self.ac3(self.con3(x))
+        x = self.bn_2d_3(x)
+        x = self.ac4(self.con4(x))
+        x = self.bn_2d_4(x)
+        x = self.ac5(self.con5(x))
+        x = self.bn_2d_5(x)
+        x = self.ac6(self.con6(x))
+        x = self.bn_2d_6(x)
+        x = self.ac7(self.con7(x))
+        x = self.bn_2d_7(x)
+        x = self.ac8(self.con8(x))
+        x = self.bn_2d_8(x)
+        x = self.ac9(self.con9(x))
+        return x
+
+# %% [code]
+model = FaceNet()
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+
+loss = torch.nn.MSELoss(reduction = 'sum')
+optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-3, amsgrad=True)
+
+# Decay LR by a factor of 0.1 every 7 epochs
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.75)
+
+# %% [code]
+model = train_model(model, loss, optimizer, scheduler, num_epochs=100)#надо хотя бы 100
+
+# %% [code]
+torch.set_grad_enabled(phase == 'train')
+X_batch, y_batch = next(iter(train_dataloader)) 
+plt.imshow(X_batch[0][0]) 
+plt.pause(0.001) 
+X_batch = X_batch.to(device) 
+preds = model(X_batch) 
+plt.imshow(preds[0].cpu()[0]) 
+plt.pause(0.001) 
+plt.imshow(y_batch[0])
+plt.imshow(y_batch[0][0]) 
+plt.pause(0.001) 
+plt.imshow(preds[0].cpu()[0]) 
+plt.pause(0.001) 
+print(torch.max(torch.abs(y_batch[0][0] - preds[0].cpu()[0]))) 
+a = preds[0].cpu()[0] 
+for i in range(512): 
+    for j in range(512): 
+        if (a[i][j] > torch.tensor(0.544343)):  
+            for k in range(10): 
+                for g in range(10): 
+                    a[(i + k - 5) % 512][(j + g - 5) % 512] = 1 
+plt.imshow(a) 
+plt.pause(0.001)
+
+# %% [code]
+gc.collect()
+torch.cuda.empty_cache() 
+print(torch.cuda.memory_allocated(device))
